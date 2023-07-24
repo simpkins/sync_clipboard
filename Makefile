@@ -5,7 +5,7 @@ all: build/sync_clipboards
 CXX=g++
 CFLAGS=-Wall -Wextra -Werror
 CXXFLAGS=$(CFLAGS) -std=c++17
-LIBS=-lxcb -lxcb-xfixes
+LIBS=-lfmt -lxcb-xfixes -lxcb
 
 build/sync_clipboards: build/main.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
