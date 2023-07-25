@@ -17,6 +17,7 @@
 #include <xcb/xcb.h>
 #include <xcb/xfixes.h>
 #include <fmt/core.h>
+#include <fmt/compile.h>
 
 constexpr uint32_t xfixes_version_major = 5;
 constexpr uint32_t xfixes_version_minor = 1;
@@ -38,6 +39,24 @@ using c_unique_ptr = std::unique_ptr<T, detail::free_deleter>;
 template <typename T>
 c_unique_ptr<T> free_wrapper(T* ptr) {
   return c_unique_ptr<T>(ptr);
+}
+
+template <typename S, typename... Args>
+inline void dbg(const S& format_str, Args&&... args) {
+  fprintf(stderr, "dbg: %s\n",
+          fmt::format(format_str, std::forward<Args>(args)...).c_str());
+}
+
+template <typename S, typename... Args>
+inline void info(const S& format_str, Args&&... args) {
+  fprintf(stdout, "%s\n",
+          fmt::format(format_str, std::forward<Args>(args)...).c_str());
+}
+
+template <typename S, typename... Args>
+inline void warn(const S& format_str, Args&&... args) {
+  fprintf(stderr, "warning: %s\n",
+          fmt::format(format_str, std::forward<Args>(args)...).c_str());
 }
 
 class XcbEvent : public c_unique_ptr<xcb_generic_event_t> {
@@ -195,11 +214,11 @@ public:
     target_ = req->target;
     requestor_ = req->requestor;
     timestamp_ = req->time;
-    printf("proxy %d: assigned to requestor %d prop %d\n", local_prop_,
-           requestor_, remote_prop_);
+    dbg("proxy {}: assigned to requestor {} prop {}", local_prop_, requestor_,
+        remote_prop_);
   }
   void unassign() {
-    printf("proxy %d: unassigned\n", local_prop_);
+    dbg("proxy {}: unassigned", local_prop_);
     remote_prop_ = XCB_ATOM_NONE;
     selection_ = XCB_ATOM_NONE;
     target_ = XCB_ATOM_NONE;
@@ -233,6 +252,7 @@ public:
   Clipboard& operator=(Clipboard&&) = default;
 
   xcb_atom_t atom() const { return atom_; }
+  const std::string& name() const { return name_; }
 
   void listen_for_changes();
   void sync_to(const Clipboard &other, xcb_window_t owner,
@@ -364,15 +384,16 @@ void Clipboard::sync_to(const Clipboard &other, xcb_window_t owner,
                         xcb_timestamp_t timestamp) {
   if (owner == XCB_NONE) {
     if (is_owned()) {
-      printf("  -> dropping ownership of %s; synced clipboard lost owner\n",
-             name_.c_str());
+      dbg("{} selection cleared; dropping ownership of {}", other.name(),
+          name_);
       ownership_end_ = timestamp;
       xcb_set_selection_owner(sync_->raw_conn(), XCB_NONE, atom_, timestamp);
       sync_->conn().flush();
     }
     return;
   }
-  printf("  -> I own %s synced owner is %d\n", name_.c_str(), owner);
+  dbg("{} selection changed (owner={}), taking ownership of {}", other.name(),
+      owner, name_);
   ownership_start_ = timestamp;
   ownership_end_ = 0;
   synced_selection_ = other.atom();
@@ -383,22 +404,22 @@ void Clipboard::sync_to(const Clipboard &other, xcb_window_t owner,
 
 void Clipboard::lost_ownership(xcb_window_t new_owner,
                                xcb_timestamp_t timestamp) {
-  printf("lost %s selection ownership; new owner=%d, timestamp=%d\n",
-         name_.c_str(), new_owner, timestamp);
+  dbg("lost {} selection ownership; new owner={}, timestamp={}", name_,
+      new_owner, timestamp);
   ownership_end_ = timestamp;
 }
 
 void Clipboard::selection_request(const xcb_selection_request_event_t *req) {
-  printf("selection request for %s\n", name_.c_str());
-  printf("  - response_type = %u\n", req->response_type);
-  printf("  - pad0 = %u\n", req->pad0);
-  printf("  - seq = %u\n", req->sequence);
-  printf("  - time = %u\n", req->time);
-  printf("  - owner = %u\n", req->owner);
-  printf("  - requestor = %u\n", req->requestor);
-  printf("  - selection = %u\n", req->selection);
-  printf("  - target = %u\n", req->target);
-  printf("  - property = %u\n", req->property);
+  dbg("selection request for {}", name_);
+  dbg("  - response_type = {:d}", req->response_type);
+  dbg("  - pad0 = {:d}", req->pad0);
+  dbg("  - seq = {:d}", req->sequence);
+  dbg("  - time = {:d}", req->time);
+  dbg("  - owner = {:d}", req->owner);
+  dbg("  - requestor = {:d}", req->requestor);
+  dbg("  - selection = {:d}", req->selection);
+  dbg("  - target = {:d}", req->target);
+  dbg("  - property = {:d}", req->property);
 
   // It would be ideal if we could simply call xcb_convert_selection()
   // with the requestor's original parameters and have the sync'ed clipboard
@@ -421,7 +442,7 @@ void Clipboard::selection_request(const xcb_selection_request_event_t *req) {
 }
 
 void Syncer::loop() {
-  printf("Listening for clipboard events; my_id=%d\n", window_id());
+  info("Listening for clipboard events; my_id={}", window_id());
   while (true) {
     auto event = conn_.wait_for_event();
     const auto type = (event->response_type & 0x7f);
@@ -440,14 +461,14 @@ void Syncer::loop() {
     } else if (type == XCB_PROPERTY_NOTIFY) {
       handle_property_notify(event.as<xcb_property_notify_event_t>());
     } else {
-      fprintf(stderr, "unknown event: %u\n", type);
+      warn("unknown event: {:d}", type);
     }
   }
 }
 
 void Syncer::handle_error(xcb_generic_error_t* err) {
   // We just print a warning for now, and do not abort the program.
-  fprintf(stderr, "error: %d\n", err->error_code);
+  warn("received XCB error: {:d}", err->error_code);
 }
 
 void Syncer::handle_selection_owner_notify(
@@ -461,7 +482,7 @@ void Syncer::handle_selection_owner_notify(
       clipboard_.sync_to(primary_, event->owner, event->timestamp);
       conn_.flush();
     } else {
-      printf("unknown selection changed: atom=%u\n", event->selection);
+      warn("unknown selection changed: atom={}", event->selection);
     }
   }
 }
@@ -472,7 +493,7 @@ void Syncer::handle_selection_clear(xcb_selection_clear_event_t *event) {
   } else if (event->selection == primary_.atom()) {
     primary_.lost_ownership(event->owner, event->time);
   } else {
-    printf("unknown selection cleared: atom=%u\n", event->selection);
+    warn("unknown selection cleared: atom={}", event->selection);
   }
 }
 
@@ -482,25 +503,23 @@ void Syncer::handle_selection_request(xcb_selection_request_event_t *event) {
   } else if (event->selection == primary_.atom()) {
     primary_.selection_request(event);
   } else {
-    printf("selection request for unknown selection: atom=%u\n",
-           event->selection);
+    warn("selection request for unknown selection: atom={}", event->selection);
   }
 }
 
 void Syncer::handle_selection_notify(xcb_selection_notify_event_t *event) {
-  printf("got XCB_SELECTION_NOTIFY event:\n");
-  printf(" - pad = %u\n", event->pad0);
-  printf(" - seq = %u\n", event->sequence);
-  printf(" - time = %u\n", event->time);
-  printf(" - requestor = %u\n", event->requestor);
-  printf(" - selection = %u\n", event->selection);
-  printf(" - target = %u\n", event->target);
-  printf(" - property = %u\n", event->property);
+  dbg("got XCB_SELECTION_NOTIFY event:");
+  dbg(" - pad = {:d}", event->pad0);
+  dbg(" - seq = {:d}", event->sequence);
+  dbg(" - time = {:d}", event->time);
+  dbg(" - requestor = {:d}", event->requestor);
+  dbg(" - selection = {:d}", event->selection);
+  dbg(" - target = {:d}", event->target);
+  dbg(" - property = {:d}", event->property);
 
   auto* req = find_request(event);
   if (!req) {
-    fprintf(stderr, "warning: received XCB_SELECTION_NOTIFY event with no "
-                    "outstanding request\n");
+    warn("received XCB_SELECTION_NOTIFY event with no outstanding request");
     return;
   }
 
@@ -514,10 +533,8 @@ void Syncer::handle_selection_notify(xcb_selection_notify_event_t *event) {
   try {
     proxy_response_data(*req);
   } catch (const std::exception& ex) {
-    fprintf(stderr,
-            "error: failed to proxy clipboard data back to original requestor: "
-            "%s\n",
-            ex.what());
+    warn("failed to proxy clipboard data back to original requestor: {}",
+         ex.what());
     fail_selection_request(*req);
     return;
   }
@@ -551,7 +568,7 @@ void Syncer::proxy_response_data(Request& req) {
   }
 
   auto length = xcb_get_property_value_length(reply.get());
-  printf("proxy %d: sending %d bytes\n", req.local_prop(), length);
+  dbg("proxy {}: sending {} bytes", req.local_prop(), length);
   auto *data = xcb_get_property_value(reply.get());
 
   xcb_change_property(raw_conn(), XCB_PROP_MODE_REPLACE, req.requestor(),
@@ -616,13 +633,13 @@ void Syncer::handle_property_notify(xcb_property_notify_event_t *event) {
   // We don't really care about XCB_PROPERTY_NOTIFY events:
   // we will wait to process the data until we get the XCB_SELECTION_NOTIFY
   // event.
-  printf("got XCB_PROPERTY_NOTIFY event\n");
-  printf(" - pad = %u\n", event->pad0);
-  printf(" - seq = %u\n", event->sequence);
-  printf(" - window = %u\n", event->window);
-  printf(" - atom = %u\n", event->atom);
-  printf(" - time = %u\n", event->time);
-  printf(" - state = %u\n", event->state);
+  dbg("got XCB_PROPERTY_NOTIFY event");
+  dbg(" - pad = {:d}", event->pad0);
+  dbg(" - seq = {:d}", event->sequence);
+  dbg(" - window = {:d}", event->window);
+  dbg(" - atom = {:d}", event->atom);
+  dbg(" - time = {:d}", event->time);
+  dbg(" - state = {:d}", event->state);
 }
 
 } // namespace
