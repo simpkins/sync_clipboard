@@ -5,13 +5,14 @@
  * https://tronche.com/gui/x/icccm/sec-2.html
  */
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string_view>
 #include <type_traits>
-#include <memory>
 #include <vector>
 
 #include <xcb/xcb.h>
@@ -43,8 +44,23 @@ c_unique_ptr<T> free_wrapper(T* ptr) {
 
 template <typename S, typename... Args>
 inline void dbg(const S& format_str, Args&&... args) {
-  fprintf(stderr, "dbg: %s\n",
-          fmt::format(format_str, std::forward<Args>(args)...).c_str());
+  const auto now = std::chrono::system_clock::now();
+  const auto now_seconds = std::chrono::floor<std::chrono::seconds>(now);
+  const time_t now_time_t = std::chrono::system_clock::to_time_t(now_seconds);
+  auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - now_seconds);
+
+  struct tm tm;
+  localtime_r(&now_time_t, &tm);
+  std::array<char, 20> time_buf;
+  auto time_len = strftime(time_buf.data(), time_buf.size(), "%H:%M:%S", &tm);
+
+  const auto msg = fmt::format(format_str, std::forward<Args>(args)...);
+  const auto full_msg =
+      fmt::format("dbg:{}.{:03d}: {}\n",
+                  std::string_view(time_buf.data(), time_len), ms.count(), msg);
+
+  fputs(full_msg.c_str(), stderr);
 }
 
 template <typename S, typename... Args>
@@ -520,11 +536,13 @@ void Syncer::handle_selection_notify(xcb_selection_notify_event_t *event) {
   auto* req = find_request(event);
   if (!req) {
     warn("received XCB_SELECTION_NOTIFY event with no outstanding request");
+    fail_selection_request(*req);
     return;
   }
 
   if (event->property == XCB_ATOM_NONE) {
     // This was a failure.
+    dbg("proxy {}: proxying failure", req->local_prop());
     fail_selection_request(*req);
     return;
   }
@@ -575,8 +593,6 @@ void Syncer::proxy_response_data(Request& req) {
                       req.remote_prop(), reply->type, reply->format, length,
                       data);
   notify_selection_request(req);
-  req.unassign();
-  conn_.flush();
 }
 
 Request *Syncer::find_request(xcb_selection_notify_event_t *event) {
@@ -585,9 +601,7 @@ Request *Syncer::find_request(xcb_selection_notify_event_t *event) {
       // Since we don't have the source property ID, look up the entry by
       // the timestamp and other fields in the request
       for (auto &req : requests_) {
-        if (req.timestamp() == event->time &&
-            req.selection() == event->selection &&
-            req.target() == event->target) {
+        if (req.timestamp() == event->time && req.target() == event->target) {
           return &req;
         }
       }
