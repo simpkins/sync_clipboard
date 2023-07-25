@@ -16,21 +16,21 @@
 #include <type_traits>
 #include <vector>
 
+#include <fmt/compile.h>
+#include <fmt/core.h>
 #include <getopt.h>
 #include <xcb/xcb.h>
 #include <xcb/xfixes.h>
-#include <fmt/core.h>
-#include <fmt/compile.h>
 
 namespace {
 
 constexpr uint32_t xfixes_version_major = 5;
 constexpr uint32_t xfixes_version_minor = 1;
 enum class LogLevel {
-    Error = 0,
-    Warn = 1,
-    Info = 2,
-    Debug = 3,
+  Error = 0,
+  Warn = 1,
+  Info = 2,
+  Debug = 3,
 };
 LogLevel g_log_level = LogLevel::Warn;
 
@@ -46,13 +46,12 @@ struct free_deleter {
 template <typename T>
 using c_unique_ptr = std::unique_ptr<T, detail::free_deleter>;
 
-template <typename T>
-c_unique_ptr<T> free_wrapper(T* ptr) {
+template <typename T> c_unique_ptr<T> free_wrapper(T *ptr) {
   return c_unique_ptr<T>(ptr);
 }
 
 template <typename S, typename... Args>
-inline void dbg(const S& format_str, Args&&... args) {
+inline void dbg(const S &format_str, Args &&... args) {
   if (g_log_level < LogLevel::Debug) {
     return;
   }
@@ -77,7 +76,7 @@ inline void dbg(const S& format_str, Args&&... args) {
 }
 
 template <typename S, typename... Args>
-inline void info(const S& format_str, Args&&... args) {
+inline void info(const S &format_str, Args &&... args) {
   if (g_log_level < LogLevel::Info) {
     return;
   }
@@ -86,7 +85,7 @@ inline void info(const S& format_str, Args&&... args) {
 }
 
 template <typename S, typename... Args>
-inline void warn(const S& format_str, Args&&... args) {
+inline void warn(const S &format_str, Args &&... args) {
   if (g_log_level < LogLevel::Warn) {
     return;
   }
@@ -149,7 +148,6 @@ public:
   get_property(bool delete_prop, xcb_window_t window_id, xcb_atom_t atom,
                xcb_atom_t type, uint32_t offset_u32, uint32_t length_u32);
 
-
   /**
    * Call xcb_change_property_checked() and ensure it succeeds.
    *
@@ -200,8 +198,8 @@ const xcb_screen_t &XcbConn::get_screen(size_t screen_num) {
 
 xcb_atom_t XcbConn::get_atom(std::string_view name, bool create) {
   xcb_generic_error_t *err = nullptr;
-  auto cookie = xcb_intern_atom(conn_, create ? 0 : 1, name.size(),
-                                name.data());
+  auto cookie =
+      xcb_intern_atom(conn_, create ? 0 : 1, name.size(), name.data());
   auto reply = free_wrapper(xcb_intern_atom_reply(conn_, cookie, &err));
   if (!reply) {
     int error_code = err ? err->error_code : -1;
@@ -367,11 +365,11 @@ class Clipboard {
 public:
   Clipboard() = default;
   Clipboard(Syncer &sync, std::string_view name);
-  Clipboard(Clipboard&&) = default;
-  Clipboard& operator=(Clipboard&&) = default;
+  Clipboard(Clipboard &&) = default;
+  Clipboard &operator=(Clipboard &&) = default;
 
   xcb_atom_t atom() const { return atom_; }
-  const std::string& name() const { return name_; }
+  const std::string &name() const { return name_; }
 
   void listen_for_changes();
   void sync_to(const Clipboard &other, xcb_window_t owner,
@@ -395,18 +393,18 @@ public:
   Syncer() = default;
 
   XcbConn &conn() { return conn_; }
-  xcb_connection_t* raw_conn() { return conn_.conn(); }
+  xcb_connection_t *raw_conn() { return conn_.conn(); }
   Window &window() { return window_; }
   xcb_window_t window_id() const { return window_.id(); }
 
   void init();
   [[noreturn]] void loop();
 
-  xcb_atom_t allocate_request_entry(const xcb_selection_request_event_t* req);
+  xcb_atom_t allocate_request_entry(const xcb_selection_request_event_t *req);
 
 private:
-  Syncer(Syncer&&) = delete;
-  Syncer& operator=(Syncer&&) = delete;
+  Syncer(Syncer &&) = delete;
+  Syncer &operator=(Syncer &&) = delete;
 
   void handle_error(xcb_generic_error_t *err);
   void
@@ -420,7 +418,7 @@ private:
 
   Request *find_request(xcb_selection_notify_event_t *event);
   void fail_selection_request(Request &req);
-  void notify_selection_request(Request& req);
+  void notify_selection_request(Request &req);
   void notify_selection_request_impl(Request &req, xcb_atom_t property);
 
   void proxy_response_data(Request &req);
@@ -576,7 +574,7 @@ void Syncer::loop() {
     const auto type = (event->response_type & 0x7f);
 
     if (event->response_type == 0) {
-        handle_error(event.as<xcb_generic_error_t>());
+      handle_error(event.as<xcb_generic_error_t>());
     } else if (type == xfixes_ext_->first_event + XCB_XFIXES_SELECTION_NOTIFY) {
       handle_selection_owner_notify(
           event.as<xcb_xfixes_selection_notify_event_t>());
@@ -594,7 +592,7 @@ void Syncer::loop() {
   }
 }
 
-void Syncer::handle_error(xcb_generic_error_t* err) {
+void Syncer::handle_error(xcb_generic_error_t *err) {
   // We just print a warning for now, and do not abort the program.
   warn("received XCB error: {:d}", err->error_code);
 }
@@ -645,7 +643,7 @@ void Syncer::handle_selection_notify(xcb_selection_notify_event_t *event) {
   dbg(" - target = {:d}", event->target);
   dbg(" - property = {:d}", event->property);
 
-  auto* req = find_request(event);
+  auto *req = find_request(event);
   if (!req) {
     warn("received XCB_SELECTION_NOTIFY event with no outstanding request");
     fail_selection_request(*req);
@@ -662,7 +660,7 @@ void Syncer::handle_selection_notify(xcb_selection_notify_event_t *event) {
   // Read the property, and send it on to the real requestor
   try {
     proxy_response_data(*req);
-  } catch (const std::exception& ex) {
+  } catch (const std::exception &ex) {
     warn("failed to proxy clipboard data back to original requestor: {}",
          ex.what());
     fail_selection_request(*req);
@@ -670,7 +668,7 @@ void Syncer::handle_selection_notify(xcb_selection_notify_event_t *event) {
   }
 }
 
-void Syncer::proxy_response_data(Request& req) {
+void Syncer::proxy_response_data(Request &req) {
   // Read the data in chunks of up to (max_chunk_size32 * 4) bytes at a time.
   // This just avoids consuming too much memory at once if the value is very
   // large.
@@ -776,14 +774,14 @@ void Syncer::incr_local_prop_changed(Request &req) {
 
 Request *Syncer::find_request(xcb_selection_notify_event_t *event) {
   if (event->property == XCB_ATOM_NONE) {
-      // This is an error response.
-      // Since we don't have the source property ID, look up the entry by
-      // the timestamp and other fields in the request
-      for (auto &req : requests_) {
-        if (req.timestamp() == event->time && req.target() == event->target) {
-          return &req;
-        }
+    // This is an error response.
+    // Since we don't have the source property ID, look up the entry by
+    // the timestamp and other fields in the request
+    for (auto &req : requests_) {
+      if (req.timestamp() == event->time && req.target() == event->target) {
+        return &req;
       }
+    }
   } else {
     for (auto &req : requests_) {
       if (req.local_prop() == event->property) {
@@ -869,7 +867,7 @@ bool Syncer::handle_req_property_change(Request &req,
   return false;
 }
 
-std::optional<int> parse_args(int argc, char** argv) {
+std::optional<int> parse_args(int argc, char **argv) {
   std::array<option, 3> long_opts{{
       {"verbose", 0, nullptr, 'v'},
       {"help", 0, nullptr, 'h'},
@@ -901,7 +899,7 @@ std::optional<int> parse_args(int argc, char** argv) {
 
 } // namespace
 
-int main(int argc, char* argv[]) {
+int main(int argc, char *argv[]) {
   auto rc = parse_args(argc, argv);
   if (rc) {
     return *rc;
