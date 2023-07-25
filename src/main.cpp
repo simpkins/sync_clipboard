@@ -145,6 +145,21 @@ public:
   const xcb_screen_t &get_screen(size_t screen_num);
   xcb_atom_t get_atom(std::string_view name, bool create = true);
 
+  c_unique_ptr<xcb_get_property_reply_t>
+  get_property(bool delete_prop, xcb_window_t window_id, xcb_atom_t atom,
+               xcb_atom_t type, uint32_t offset_u32, uint32_t length_u32);
+
+
+  /**
+   * Call xcb_change_property_checked() and ensure it succeeds.
+   *
+   * Throws an exception if an error occurs.
+   */
+  void change_property(uint8_t mode, xcb_window_t window_id,
+                       xcb_atom_t property, xcb_atom_t type, uint8_t format,
+                       uint32_t data_len, const void *data);
+  void change_win_event_mask(xcb_window_t window_id, uint32_t mask);
+
 private:
   void destroy() {
     if (conn_) {
@@ -197,6 +212,48 @@ xcb_atom_t XcbConn::get_atom(std::string_view name, bool create) {
   return atom;
 }
 
+c_unique_ptr<xcb_get_property_reply_t>
+XcbConn::get_property(bool delete_prop, xcb_window_t window_id, xcb_atom_t atom,
+                      xcb_atom_t type, uint32_t offset_u32,
+                      uint32_t length_u32) {
+  auto cookie =
+      xcb_get_property(conn_, /*delete=*/static_cast<uint8_t>(delete_prop),
+                       window_id, atom, type, offset_u32, length_u32);
+  xcb_generic_error_t *err = nullptr;
+  auto reply = free_wrapper(xcb_get_property_reply(conn_, cookie, &err));
+  if (!reply) {
+    int error_code = err ? err->error_code : -1;
+    throw std::runtime_error(
+        fmt::format("failed to get property {} on window {}: {}", atom,
+                    window_id, error_code));
+  }
+
+  return reply;
+}
+
+void XcbConn::change_property(uint8_t mode, xcb_window_t window_id,
+                              xcb_atom_t property, xcb_atom_t type,
+                              uint8_t format, uint32_t data_len,
+                              const void *data) {
+  auto cookie = xcb_change_property_checked(conn_, mode, window_id, property,
+                                            type, format, data_len, data);
+  auto error = free_wrapper(xcb_request_check(conn_, cookie));
+  if (error) {
+    throw std::runtime_error(
+        fmt::format("error setting window property: {}", error->error_code));
+  }
+}
+
+void XcbConn::change_win_event_mask(xcb_window_t window_id, uint32_t mask) {
+  auto cookie = xcb_change_window_attributes_checked(conn_, window_id,
+                                                     XCB_CW_EVENT_MASK, &mask);
+  auto error = free_wrapper(xcb_request_check(conn_, cookie));
+  if (error) {
+    throw std::runtime_error(
+        fmt::format("error updating window event mask: {}", error->error_code));
+  }
+}
+
 class Window {
 public:
   Window() = default;
@@ -236,14 +293,26 @@ private:
  */
 class Request {
 public:
+  enum class State {
+    NotInUse,
+    // Waiting for the initial reply from the upstream selection ownrr
+    PendingReply,
+    // waiting for the requestor to delete their property
+    WaitingIncrRemoteProp,
+    // waiting for the upstream selection owner to update our property
+    WaitingIncrLocalProp,
+    Error,
+  };
+
   explicit Request(xcb_atom_t local_prop) : local_prop_(local_prop) {}
   Request(xcb_atom_t local_prop, const xcb_selection_request_event_t *req)
       : local_prop_(local_prop) {
     assign(req);
   }
 
-  bool in_use() const { return requestor_ != XCB_WINDOW_NONE; }
+  bool is_available() const { return state_ == State::NotInUse; }
   void assign(const xcb_selection_request_event_t *req) {
+    state_ = State::PendingReply;
     remote_prop_ = req->property;
     selection_ = req->selection;
     target_ = req->target;
@@ -259,6 +328,20 @@ public:
     target_ = XCB_ATOM_NONE;
     requestor_ = XCB_WINDOW_NONE;
     timestamp_ = 0;
+    state_ = State::NotInUse;
+  }
+
+  State state() const { return state_; }
+  void set_state_incr_waiting_remote() {
+    state_ = State::WaitingIncrRemoteProp;
+  }
+  void set_state_incr_waiting_local() { state_ = State::WaitingIncrLocalProp; }
+  void place_in_error_mode() {
+    // Set the state to error_ so that we do not attempt to re-use this local
+    // property for future transfers.  We started an xcb_convert_selection()
+    // attempt but something went wrong, and we're not sure if the selection
+    // owner might still attempt to update this property in the future.
+    state_ = State::Error;
   }
 
   xcb_window_t requestor() const { return requestor_; }
@@ -270,6 +353,7 @@ public:
 
 private:
   const xcb_atom_t local_prop_ = XCB_ATOM_NONE;
+  State state_ = State::NotInUse;
   xcb_atom_t remote_prop_ = XCB_ATOM_NONE;
   xcb_atom_t selection_ = XCB_ATOM_NONE;
   xcb_atom_t target_ = XCB_ATOM_NONE;
@@ -331,18 +415,26 @@ private:
   void handle_selection_request(xcb_selection_request_event_t *event);
   void handle_selection_notify(xcb_selection_notify_event_t *event);
   void handle_property_notify(xcb_property_notify_event_t *event);
+  bool handle_req_property_change(Request &req,
+                                  xcb_property_notify_event_t *event);
 
   Request *find_request(xcb_selection_notify_event_t *event);
-  void fail_selection_request(Request& req);
+  void fail_selection_request(Request &req);
   void notify_selection_request(Request& req);
   void notify_selection_request_impl(Request &req, xcb_atom_t property);
 
   void proxy_response_data(Request &req);
+  void start_incr_transfer(c_unique_ptr<xcb_get_property_reply_t> prop,
+                           Request &req);
+  void incr_remote_prop_deleted(Request &req);
+  void incr_local_prop_changed(Request &req);
 
   XcbConn conn_;
   Window window_;
   Clipboard clipboard_;
   Clipboard primary_;
+  // The maximum allowed request size to the server, in 4-byte multiples.
+  uint32_t max_request_size_u32_ = 0;
   xcb_atom_t incr_ = XCB_ATOM_NONE;
   const xcb_query_extension_reply_t *xfixes_ext_ = nullptr;
   std::vector<Request> requests_;
@@ -351,6 +443,7 @@ private:
 void Syncer::init() {
   auto preferred_screen = conn_.connect(nullptr);
   auto screen = conn_.get_screen(preferred_screen);
+  max_request_size_u32_ = xcb_get_maximum_request_length(raw_conn());
 
   // Verify XFIXES is available
   auto xfixes_cookie = xcb_xfixes_query_version(
@@ -392,7 +485,7 @@ Syncer::allocate_request_entry(const xcb_selection_request_event_t *req) {
   // requests_ vector here since all operation is single threaded.
   for (size_t idx = 0; idx < requests_.size(); ++idx) {
     auto &entry = requests_[idx];
-    if (!entry.in_use()) {
+    if (entry.is_available()) {
       entry.assign(req);
       return entry.local_prop();
     }
@@ -584,22 +677,12 @@ void Syncer::proxy_response_data(Request& req) {
   uint32_t max_chunk_size_u32 = 2000;
   uint32_t offset_u32 = 0;
   while (true) {
-    auto cookie =
-        xcb_get_property(raw_conn(), /*delete=*/0, window_id(),
-                         req.local_prop(), XCB_GET_PROPERTY_TYPE_ANY,
-                         offset_u32, max_chunk_size_u32);
-    xcb_generic_error_t *err = nullptr;
-    auto reply = free_wrapper(xcb_get_property_reply(raw_conn(), cookie, &err));
-    if (!reply) {
-      int error_code = err ? err->error_code : -1;
-      throw std::runtime_error(
-          fmt::format("failed to get window property {}: {}", req.local_prop(),
-                      error_code));
-    }
-
+    auto reply = conn_.get_property(
+        /*delete=*/false, window_id(), req.local_prop(),
+        XCB_GET_PROPERTY_TYPE_ANY, offset_u32, max_chunk_size_u32);
     if (reply->type == incr_) {
-      // TODO
-      throw std::runtime_error("INCR transfers unsupported for now");
+      start_incr_transfer(std::move(reply), req);
+      return;
     }
 
     auto length = xcb_get_property_value_length(reply.get());
@@ -608,14 +691,8 @@ void Syncer::proxy_response_data(Request& req) {
     auto *data = xcb_get_property_value(reply.get());
     const uint8_t mode =
         offset_u32 == 0 ? XCB_PROP_MODE_REPLACE : XCB_PROP_MODE_APPEND;
-    auto change_cookie = xcb_change_property_checked(
-        raw_conn(), mode, req.requestor(), req.remote_prop(), reply->type,
-        reply->format, length, data);
-    auto error = free_wrapper(xcb_request_check(raw_conn(), change_cookie));
-    if (error) {
-      throw std::runtime_error(fmt::format(
-          "error setting property on requestor: {}", error->error_code));
-    }
+    conn_.change_property(mode, req.requestor(), req.remote_prop(), reply->type,
+                          reply->format, length, data);
 
     if (reply->bytes_after > 0) {
       offset_u32 += (length / 4);
@@ -625,6 +702,76 @@ void Syncer::proxy_response_data(Request& req) {
   }
 
   notify_selection_request(req);
+  req.unassign();
+}
+
+void Syncer::start_incr_transfer(c_unique_ptr<xcb_get_property_reply_t> prop,
+                                 Request &req) {
+  if (prop->bytes_after > 0) {
+    // This shouldn't normally happen, the initial payload should always
+    // be a single intege.
+    throw std::runtime_error("error starting INCR transfer: initial message "
+                             "contained more data than expected");
+  }
+
+  // Register to receive updates when properties change on the requestor,
+  // so we can tell when it has read and deleted this property.
+  conn_.change_win_event_mask(req.requestor(), XCB_EVENT_MASK_PROPERTY_CHANGE);
+  req.set_state_incr_waiting_remote();
+
+  // Send the data to the requestor
+  auto length = xcb_get_property_value_length(prop.get());
+  auto *data = xcb_get_property_value(prop.get());
+  dbg("proxy {}: starting INCR transfer with {} bytes", req.local_prop(),
+      length);
+  conn_.change_property(XCB_PROP_MODE_REPLACE, req.requestor(),
+                        req.remote_prop(), prop->type, prop->format, length,
+                        data);
+
+  notify_selection_request(req);
+  // Now we return and wait for the caller to notify us of a property change
+}
+
+void Syncer::incr_remote_prop_deleted(Request &req) {
+  dbg("proxy {}: requesting more INCR data", req.local_prop());
+  req.set_state_incr_waiting_local();
+
+  // Delete our property to inform the upstream selection to send more data
+  auto cookie =
+      xcb_delete_property_checked(raw_conn(), window_id(), req.local_prop());
+  auto error = free_wrapper(xcb_request_check(raw_conn(), cookie));
+  if (error) {
+    throw std::runtime_error(fmt::format(
+        "error deleting property for INCR transfer: {}", error->error_code));
+  }
+}
+
+void Syncer::incr_local_prop_changed(Request &req) {
+  auto reply = conn_.get_property(
+      /*delete=*/false, window_id(), req.local_prop(),
+      XCB_GET_PROPERTY_TYPE_ANY, /*long_offset=*/0, max_request_size_u32_);
+  if (reply->type == incr_) {
+    start_incr_transfer(std::move(reply), req);
+    return;
+  }
+
+  auto length = xcb_get_property_value_length(reply.get());
+  dbg("proxy {}: received more INCR data: {} bytes", req.local_prop(), length);
+  if (reply->bytes_after > 0) {
+    throw std::runtime_error(
+        "error reading INCR data: requested too small a chunk");
+  }
+
+  auto *data = xcb_get_property_value(reply.get());
+  conn_.change_property(XCB_PROP_MODE_REPLACE, req.requestor(),
+                        req.remote_prop(), reply->type, reply->format, length,
+                        data);
+  if (length == 0) {
+    dbg("proxy {}: INCR transfer complete", req.local_prop());
+    req.unassign();
+  } else {
+    req.set_state_incr_waiting_remote();
+  }
 }
 
 Request *Syncer::find_request(xcb_selection_notify_event_t *event) {
@@ -652,6 +799,7 @@ Request *Syncer::find_request(xcb_selection_notify_event_t *event) {
 
 void Syncer::fail_selection_request(Request &req) {
   notify_selection_request_impl(req, XCB_ATOM_NONE);
+  req.unassign();
 }
 
 void Syncer::notify_selection_request(Request &req) {
@@ -671,14 +819,10 @@ void Syncer::notify_selection_request_impl(Request &req, xcb_atom_t property) {
   xcb_send_event(raw_conn(), propagate, req.requestor(),
                  XCB_EVENT_MASK_NO_EVENT,
                  reinterpret_cast<const char *>(&resp));
-  req.unassign();
   conn_.flush();
 }
 
 void Syncer::handle_property_notify(xcb_property_notify_event_t *event) {
-  // We don't really care about XCB_PROPERTY_NOTIFY events:
-  // we will wait to process the data until we get the XCB_SELECTION_NOTIFY
-  // event.
   dbg("got XCB_PROPERTY_NOTIFY event");
   dbg(" - pad = {:d}", event->pad0);
   dbg(" - seq = {:d}", event->sequence);
@@ -686,6 +830,43 @@ void Syncer::handle_property_notify(xcb_property_notify_event_t *event) {
   dbg(" - atom = {:d}", event->atom);
   dbg(" - time = {:d}", event->time);
   dbg(" - state = {:d}", event->state);
+
+  for (auto &req : requests_) {
+    if (handle_req_property_change(req, event)) {
+      break;
+    }
+  }
+}
+
+bool Syncer::handle_req_property_change(Request &req,
+                                        xcb_property_notify_event_t *event) {
+  if (req.state() == Request::State::WaitingIncrLocalProp &&
+      event->window == window_id() && event->atom == req.local_prop() &&
+      event->state != XCB_PROPERTY_DELETE) {
+    try {
+      incr_local_prop_changed(req);
+    } catch (const std::exception &ex) {
+      warn("error attempting to forward property during INCR transfer: {}",
+           ex.what());
+      // Unfortunately there isn't really any good way to abort INCR transfers
+      req.place_in_error_mode();
+    }
+    return true;
+  } else if (req.state() == Request::State::WaitingIncrRemoteProp &&
+             event->window == req.requestor() &&
+             event->atom == req.remote_prop() &&
+             event->state == XCB_PROPERTY_DELETE) {
+    try {
+      incr_remote_prop_deleted(req);
+    } catch (const std::exception &ex) {
+      warn("error attempting to delete property during INCR transfer: {}",
+           ex.what());
+      // Unfortunately there isn't really any good way to abort INCR transfers
+      req.place_in_error_mode();
+    }
+    return true;
+  }
+  return false;
 }
 
 std::optional<int> parse_args(int argc, char** argv) {
