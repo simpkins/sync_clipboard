@@ -562,36 +562,45 @@ void Syncer::proxy_response_data(Request& req) {
   // TODO: perhaps add a state member variable to Request to track that we are
   // now proxying the data back to the original requestor?
 
-  // TODO: We probably should specify a smaller long_length field,
-  // and make multiple calls with increasing offsets to fetch the data in
-  // chunks if it is very large (and not using the INCR protocol).
-  auto cookie = xcb_get_property(raw_conn(), /*delete=*/0, window_id(),
-                                 req.local_prop(), XCB_GET_PROPERTY_TYPE_ANY,
-                                 /*long_offset=*/0, /*long_length=*/0x1fffffff);
-  xcb_generic_error_t *err = nullptr;
+  // Read the data in chunks of up to (max_chunk_size32 * 4) bytes at a time.
+  // This just avoids consuming too much memory at once if the value is very
+  // large.
+  uint32_t max_chunk_size_u32 = 2000;
+  uint32_t offset_u32 = 0;
+  while (true) {
+    auto cookie =
+        xcb_get_property(raw_conn(), /*delete=*/0, window_id(),
+                         req.local_prop(), XCB_GET_PROPERTY_TYPE_ANY,
+                         offset_u32, max_chunk_size_u32);
+    xcb_generic_error_t *err = nullptr;
+    auto reply = free_wrapper(xcb_get_property_reply(raw_conn(), cookie, &err));
+    if (!reply) {
+      int error_code = err ? err->error_code : -1;
+      throw std::runtime_error(
+          fmt::format("failed to get window property {}: {}", req.local_prop(),
+                      error_code));
+    }
 
-  // TODO: rather than calling xcb_get_property_reply immediately, it would
-  // perhaps be better to use xcb_get_property_unchecked() and then process
-  // this reply in the event loop, so other events could be handled in the
-  // interim.
-  auto reply = free_wrapper(xcb_get_property_reply(raw_conn(), cookie, &err));
-  if (!reply) {
-    int error_code = err ? err->error_code : -1;
-    throw std::runtime_error(fmt::format("failed to get window property {}: {}",
-                                         req.local_prop(), error_code));
+    if (reply->type == incr_) {
+      throw std::runtime_error("INCR unsupported for now");
+    }
+
+    auto length = xcb_get_property_value_length(reply.get());
+    dbg("proxy {}: forwarding {} bytes; {} remain", req.local_prop(), length,
+        reply->bytes_after);
+    auto *data = xcb_get_property_value(reply.get());
+    const uint8_t mode =
+        offset_u32 == 0 ? XCB_PROP_MODE_REPLACE : XCB_PROP_MODE_APPEND;
+    xcb_change_property(raw_conn(), mode, req.requestor(), req.remote_prop(),
+                        reply->type, reply->format, length, data);
+
+    if (reply->bytes_after > 0) {
+      offset_u32 += (length / 4);
+      continue;
+    }
+    break;
   }
 
-  if (reply->type == incr_) {
-    throw std::runtime_error("INCR unsupported for now");
-  }
-
-  auto length = xcb_get_property_value_length(reply.get());
-  dbg("proxy {}: sending {} bytes", req.local_prop(), length);
-  auto *data = xcb_get_property_value(reply.get());
-
-  xcb_change_property(raw_conn(), XCB_PROP_MODE_REPLACE, req.requestor(),
-                      req.remote_prop(), reply->type, reply->format, length,
-                      data);
   notify_selection_request(req);
 }
 
