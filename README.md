@@ -14,3 +14,11 @@ owner of the other buffer.
 
 The X11 selection behavior behavior is [awkwardly complex](https://www.uninformativ.de/blog/postings/2017-04-02/0/POSTING-en.html),
 and can really act more like a dynamic pipe than a simple static buffer.
+
+# Building
+
+```
+cd build && mkdir build
+cmake ..
+make
+```
