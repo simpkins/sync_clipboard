@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,15 +16,23 @@
 #include <type_traits>
 #include <vector>
 
+#include <getopt.h>
 #include <xcb/xcb.h>
 #include <xcb/xfixes.h>
 #include <fmt/core.h>
 #include <fmt/compile.h>
 
+namespace {
+
 constexpr uint32_t xfixes_version_major = 5;
 constexpr uint32_t xfixes_version_minor = 1;
-
-namespace {
+enum class LogLevel {
+    Error = 0,
+    Warn = 1,
+    Info = 2,
+    Debug = 3,
+};
+LogLevel g_log_level = LogLevel::Warn;
 
 namespace detail {
 struct free_deleter {
@@ -44,6 +53,10 @@ c_unique_ptr<T> free_wrapper(T* ptr) {
 
 template <typename S, typename... Args>
 inline void dbg(const S& format_str, Args&&... args) {
+  if (g_log_level < LogLevel::Debug) {
+    return;
+  }
+
   const auto now = std::chrono::system_clock::now();
   const auto now_seconds = std::chrono::floor<std::chrono::seconds>(now);
   const time_t now_time_t = std::chrono::system_clock::to_time_t(now_seconds);
@@ -65,12 +78,18 @@ inline void dbg(const S& format_str, Args&&... args) {
 
 template <typename S, typename... Args>
 inline void info(const S& format_str, Args&&... args) {
+  if (g_log_level < LogLevel::Info) {
+    return;
+  }
   fprintf(stdout, "%s\n",
           fmt::format(format_str, std::forward<Args>(args)...).c_str());
 }
 
 template <typename S, typename... Args>
 inline void warn(const S& format_str, Args&&... args) {
+  if (g_log_level < LogLevel::Warn) {
+    return;
+  }
   fprintf(stderr, "warning: %s\n",
           fmt::format(format_str, std::forward<Args>(args)...).c_str());
 }
@@ -400,16 +419,16 @@ void Clipboard::sync_to(const Clipboard &other, xcb_window_t owner,
                         xcb_timestamp_t timestamp) {
   if (owner == XCB_NONE) {
     if (is_owned()) {
-      dbg("{} selection cleared; dropping ownership of {}", other.name(),
-          name_);
+      info("{} selection cleared; dropping ownership of {}", other.name(),
+           name_);
       ownership_end_ = timestamp;
       xcb_set_selection_owner(sync_->raw_conn(), XCB_NONE, atom_, timestamp);
       sync_->conn().flush();
     }
     return;
   }
-  dbg("{} selection changed (owner={}), taking ownership of {}", other.name(),
-      owner, name_);
+  info("{} selection changed (owner={}), taking ownership of {}", other.name(),
+       owner, name_);
   ownership_start_ = timestamp;
   ownership_end_ = 0;
   synced_selection_ = other.atom();
@@ -665,12 +684,43 @@ void Syncer::handle_property_notify(xcb_property_notify_event_t *event) {
   dbg(" - state = {:d}", event->state);
 }
 
+std::optional<int> parse_args(int argc, char** argv) {
+  std::array<option, 3> long_opts{{
+      {"verbose", 0, nullptr, 'v'},
+      {"help", 0, nullptr, 'h'},
+      {nullptr, 0, nullptr, 0},
+  }};
+
+  while (true) {
+    int long_index;
+    auto opt = getopt_long(argc, argv, "vh", long_opts.data(), &long_index);
+    if (opt == -1) {
+      return std::nullopt;
+    } else if (opt == '?') {
+      return 2;
+    } else if (opt == 'v') {
+      g_log_level = static_cast<LogLevel>(static_cast<int>(g_log_level) + 1);
+    } else if (opt == 'h') {
+      printf("sync_clipboard: synchronize X11 selection buffers\n"
+             "\n"
+             "Usage:\n"
+             "  -h, --help      Show this help message and exit.\n"
+             "  -v, --verbose   Increase the output verbosity.\n");
+      return 0;
+    } else {
+      throw std::runtime_error(
+          fmt::format("unexpected getopt return value {:d}", opt));
+    }
+  }
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
-  // TODO: parse args
-  (void)argc;
-  (void)argv;
+  auto rc = parse_args(argc, argv);
+  if (rc) {
+    return *rc;
+  }
 
   try {
     Syncer sync;
