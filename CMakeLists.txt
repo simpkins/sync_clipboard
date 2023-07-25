@@ -36,8 +36,10 @@ set_target_properties(
 #
 # Our code
 #
+set(COMPILE_FLAGS -Wall -Werror -Wextra)
+
 add_executable(sync_clipboard src/main.cpp)
 target_link_libraries(sync_clipboard fmt::fmt xcb::xfixes)
 #target_link_libraries(sync_clipboard xcb-fixes)
 target_compile_features(sync_clipboard PUBLIC cxx_std_17)
-target_compile_options(sync_clipboard PRIVATE ${PEDANTIC_COMPILE_FLAGS})
+target_compile_options(sync_clipboard PRIVATE ${COMPILE_FLAGS})
