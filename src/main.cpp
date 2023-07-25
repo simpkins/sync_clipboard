@@ -578,9 +578,6 @@ void Syncer::handle_selection_notify(xcb_selection_notify_event_t *event) {
 }
 
 void Syncer::proxy_response_data(Request& req) {
-  // TODO: perhaps add a state member variable to Request to track that we are
-  // now proxying the data back to the original requestor?
-
   // Read the data in chunks of up to (max_chunk_size32 * 4) bytes at a time.
   // This just avoids consuming too much memory at once if the value is very
   // large.
@@ -601,7 +598,8 @@ void Syncer::proxy_response_data(Request& req) {
     }
 
     if (reply->type == incr_) {
-      throw std::runtime_error("INCR unsupported for now");
+      // TODO
+      throw std::runtime_error("INCR transfers unsupported for now");
     }
 
     auto length = xcb_get_property_value_length(reply.get());
@@ -610,8 +608,14 @@ void Syncer::proxy_response_data(Request& req) {
     auto *data = xcb_get_property_value(reply.get());
     const uint8_t mode =
         offset_u32 == 0 ? XCB_PROP_MODE_REPLACE : XCB_PROP_MODE_APPEND;
-    xcb_change_property(raw_conn(), mode, req.requestor(), req.remote_prop(),
-                        reply->type, reply->format, length, data);
+    auto change_cookie = xcb_change_property_checked(
+        raw_conn(), mode, req.requestor(), req.remote_prop(), reply->type,
+        reply->format, length, data);
+    auto error = free_wrapper(xcb_request_check(raw_conn(), change_cookie));
+    if (error) {
+      throw std::runtime_error(fmt::format(
+          "error setting property on requestor: {}", error->error_code));
+    }
 
     if (reply->bytes_after > 0) {
       offset_u32 += (length / 4);
@@ -725,8 +729,6 @@ int main(int argc, char* argv[]) {
   try {
     Syncer sync;
     sync.init();
-
-    // TODO: perhaps sync the clipboard contents on start
 
     sync.loop();
   } catch (const std::exception &ex) {
