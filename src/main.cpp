@@ -518,6 +518,7 @@ void Clipboard::sync_to(const Clipboard &other, xcb_window_t owner,
     }
     return;
   }
+
   info("{} selection changed (owner={}), taking ownership of {}", other.name(),
        owner, name_);
   ownership_start_ = timestamp;
@@ -546,6 +547,25 @@ void Clipboard::selection_request(const xcb_selection_request_event_t *req) {
   dbg("  - selection = {:d}", req->selection);
   dbg("  - target = {:d}", req->target);
   dbg("  - property = {:d}", req->property);
+
+  if (req->requestor == sync_->window_id()) {
+    // Hmm, we are requesting data from ourself.  We probably managed to grab
+    // ownership of both clipboards at the same time, which isn't great.
+    warn("got request from ourself");
+    xcb_selection_notify_event_t resp = {};
+    resp.response_type = XCB_SELECTION_NOTIFY;
+    resp.sequence = 0;
+    resp.time = req->time;
+    resp.requestor = req->requestor;
+    resp.selection = req->selection;
+    resp.target = req->target;
+    resp.property = XCB_ATOM_NONE;
+    xcb_send_event(sync_->raw_conn(), /*propagate=*/0, req->requestor,
+                   XCB_EVENT_MASK_NO_EVENT,
+                   reinterpret_cast<const char *>(&resp));
+    sync_->conn().flush();
+    return;
+  }
 
   // It would be ideal if we could simply call xcb_convert_selection()
   // with the requestor's original parameters and have the sync'ed clipboard
@@ -805,7 +825,6 @@ void Syncer::notify_selection_request(Request &req) {
 }
 
 void Syncer::notify_selection_request_impl(Request &req, xcb_atom_t property) {
-  constexpr uint8_t propagate = 0;
   xcb_selection_notify_event_t resp = {};
   resp.response_type = XCB_SELECTION_NOTIFY;
   resp.sequence = 0;
@@ -814,7 +833,7 @@ void Syncer::notify_selection_request_impl(Request &req, xcb_atom_t property) {
   resp.selection = req.selection();
   resp.target = req.target();
   resp.property = property;
-  xcb_send_event(raw_conn(), propagate, req.requestor(),
+  xcb_send_event(raw_conn(), /*propagate=*/0, req.requestor(),
                  XCB_EVENT_MASK_NO_EVENT,
                  reinterpret_cast<const char *>(&resp));
   conn_.flush();
