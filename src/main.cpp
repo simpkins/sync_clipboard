@@ -375,12 +375,12 @@ public:
   void listen_for_changes();
   void sync_to(const Clipboard &other, xcb_window_t owner,
                xcb_timestamp_t timestamp);
+  void drop_ownership(xcb_timestamp_t timestamp);
   void lost_ownership(xcb_window_t new_owner, xcb_timestamp_t timestamp);
   void selection_request(const xcb_selection_request_event_t *req);
-
-private:
   bool is_owned() const { return ownership_end_ == 0 && ownership_start_ > 0; }
 
+private:
   xcb_atom_t atom_ = XCB_ATOM_NONE;
   Syncer *sync_ = nullptr;
   std::string name_;
@@ -507,27 +507,15 @@ void Clipboard::listen_for_changes() {
                                     atom_, event_mask);
 }
 
-void Clipboard::sync_to(const Clipboard &other, xcb_window_t owner,
+void Clipboard::sync_to(const Clipboard &other, xcb_window_t /*owner*/,
                         xcb_timestamp_t timestamp) {
-  if (owner == XCB_NONE) {
-    if (is_owned()) {
-      info("{} selection cleared; dropping ownership of {}", other.name(),
-           name_);
-      ownership_end_ = timestamp;
-      xcb_set_selection_owner(sync_->raw_conn(), XCB_NONE, atom_, timestamp);
-      sync_->conn().flush();
-    }
-    return;
-  }
-
-  info("{} selection changed (owner={}), taking ownership of {}", other.name(),
-       owner, name_);
   ownership_start_ = timestamp;
   ownership_end_ = 0;
   synced_selection_ = other.atom();
-  xcb_set_selection_owner(sync_->raw_conn(), sync_->window_id(), atom_,
-                          timestamp);
-  sync_->conn().flush();
+}
+
+void Clipboard::drop_ownership(xcb_timestamp_t timestamp) {
+  ownership_end_ = timestamp;
 }
 
 void Clipboard::lost_ownership(xcb_window_t new_owner,
@@ -622,16 +610,67 @@ void Syncer::handle_selection_owner_notify(
     xcb_xfixes_selection_notify_event_t *event) {
   if (event->owner == window_id()) {
     // Ignore events about us taking ownership
-  } else {
-    if (event->selection == clipboard_.atom()) {
-      primary_.sync_to(clipboard_, event->owner, event->timestamp);
-    } else if (event->selection == primary_.atom()) {
-      clipboard_.sync_to(primary_, event->owner, event->timestamp);
-      conn_.flush();
-    } else {
-      warn("unknown selection changed: atom={}", event->selection);
-    }
+    return;
   }
+
+  Clipboard* modified;
+  Clipboard* synced;
+  if (event->selection == clipboard_.atom()) {
+    modified = &clipboard_;
+    synced = &primary_;
+  } else if (event->selection == primary_.atom()) {
+    modified = &primary_;
+    synced = &clipboard_;
+  } else {
+    return;
+  }
+
+  if (event->owner == XCB_NONE) {
+    if (synced->is_owned()) {
+      info("{} selection cleared; dropping ownership of {}", modified->name(),
+           synced->name());
+      synced->drop_ownership(event->timestamp);
+      xcb_set_selection_owner(raw_conn(), XCB_NONE, synced->atom(),
+                              event->timestamp);
+      conn_.flush();
+    }
+    return;
+  }
+
+  if (modified->is_owned()) {
+    // We got an event about ownership of this clipboard being claimed by
+    // someone else, but we think that we currently own it.
+    //
+    // This typically happens if another applications claims both clipboards at
+    // the same time.  Several applications do this when they intentionally
+    // want to keep the buffers in sync.  e.g., firefox can do it when you hit
+    // Ctrl-C, keepassxc does it when copying username or passwords, etc.
+    //
+    // When this happens, the other application claims both selection buffers.
+    // The X server will send us 2 notifications about the ownership change of
+    // each buffer.  When we process the first notification we will mark that
+    // we own the second buffer and will send our xcb_set_selection_owner()
+    // request.  We will then process the second selection ownership
+    // notification, which was really generated before our
+    // xcb_set_selection_owner() call and is now out of date.
+    //
+    // Just ignore the ownership notification in this case.  We definitely
+    // don't want to try to claim ownership of the synced buffer if we own the
+    // modified buffer, since we can't ask ourselves for the buffer contents.
+    // We will get an XCB_SELECTION_CLEAR event when we actually lose ownership
+    // of this buffer.
+    dbg("processing ownership event for {} claimed by {}, but we already "
+        "claimed it",
+        modified->name(), event->owner);
+    return;
+  }
+
+  info("{} selection changed (owner={}), taking ownership of {}",
+       modified->name(), event->owner, synced->name());
+  synced->sync_to(*modified, event->owner, event->timestamp);
+  xcb_set_selection_owner(raw_conn(), window_id(), synced->atom(),
+                          event->timestamp);
+  conn_.flush();
 }
 
 void Syncer::handle_selection_clear(xcb_selection_clear_event_t *event) {
