@@ -233,8 +233,9 @@ void XcbConn::change_property(uint8_t mode, xcb_window_t window_id,
                               xcb_atom_t property, xcb_atom_t type,
                               uint8_t format, uint32_t data_len,
                               const void *data) {
+  uint32_t num_elements = data_len / (format / 8);
   auto cookie = xcb_change_property_checked(conn_, mode, window_id, property,
-                                            type, format, data_len, data);
+                                            type, format, num_elements, data);
   auto error = free_wrapper(xcb_request_check(conn_, cookie));
   if (error) {
     throw std::runtime_error(
