@@ -381,6 +381,8 @@ public:
   bool is_owned() const { return ownership_end_ == 0 && ownership_start_ > 0; }
 
 private:
+  void fail_selection_request(const xcb_selection_request_event_t *req);
+
   xcb_atom_t atom_ = XCB_ATOM_NONE;
   Syncer *sync_ = nullptr;
   std::string name_;
@@ -399,6 +401,7 @@ public:
   xcb_window_t window_id() const { return window_.id(); }
 
   void init();
+  void there_can_be_only_one();
   [[noreturn]] void loop();
 
   xcb_atom_t allocate_request_entry(const xcb_selection_request_event_t *req);
@@ -435,6 +438,7 @@ private:
   // The maximum allowed request size to the server, in 4-byte multiples.
   uint32_t max_request_size_u32_ = 0;
   xcb_atom_t incr_ = XCB_ATOM_NONE;
+  xcb_atom_t unique_key_ = XCB_ATOM_NONE;
   const xcb_query_extension_reply_t *xfixes_ext_ = nullptr;
   std::vector<Request> requests_;
 };
@@ -459,6 +463,7 @@ void Syncer::init() {
   }
 
   incr_ = conn_.get_atom("INCR");
+  unique_key_ = conn_.get_atom("_SYNC_CLIPBOARD_UNIQUE");
 
   // Create a window for events to be delivered to.
   // We don't ever map the window to the display, so it is not shown.
@@ -473,20 +478,29 @@ void Syncer::init() {
   // Set up our clipboard state
   clipboard_ = Clipboard(*this, "CLIPBOARD");
   primary_ = Clipboard(*this, "PRIMARY");
-  clipboard_.listen_for_changes();
-  primary_.listen_for_changes();
-  conn_.flush();
 }
 
 xcb_atom_t
 Syncer::allocate_request_entry(const xcb_selection_request_event_t *req) {
   // Note that we don't need to perform any synchronization around the
   // requests_ vector here since all operation is single threaded.
+  size_t outstanding_requests = 0;
   for (size_t idx = 0; idx < requests_.size(); ++idx) {
     auto &entry = requests_[idx];
     if (entry.is_available()) {
       entry.assign(req);
       return entry.local_prop();
+    } else if (entry.state() != Request::State::Error) {
+      ++outstanding_requests;
+      if (outstanding_requests > 50) {
+        // Limit the number of outstanding requests.
+        // e.g., if there are two sync_clipboard processes running on the same
+        // server we want to place a limit so they can't just keep recursively
+        // asking each other for data forever.
+        warn("received clipboard request with more than 50 requests already "
+             "outstanding; refusing to process more");
+        return XCB_ATOM_NONE;
+      }
     }
   }
 
@@ -541,18 +555,7 @@ void Clipboard::selection_request(const xcb_selection_request_event_t *req) {
     // Hmm, we are requesting data from ourself.  We probably managed to grab
     // ownership of both clipboards at the same time, which isn't great.
     warn("got request from ourself");
-    xcb_selection_notify_event_t resp = {};
-    resp.response_type = XCB_SELECTION_NOTIFY;
-    resp.sequence = 0;
-    resp.time = req->time;
-    resp.requestor = req->requestor;
-    resp.selection = req->selection;
-    resp.target = req->target;
-    resp.property = XCB_ATOM_NONE;
-    xcb_send_event(sync_->raw_conn(), /*propagate=*/0, req->requestor,
-                   XCB_EVENT_MASK_NO_EVENT,
-                   reinterpret_cast<const char *>(&resp));
-    sync_->conn().flush();
+    fail_selection_request(req);
     return;
   }
 
@@ -571,9 +574,79 @@ void Clipboard::selection_request(const xcb_selection_request_event_t *req) {
   // and then we forward it along to the original requestor.
 
   auto prop = sync_->allocate_request_entry(req);
+  if (prop == XCB_ATOM_NONE) {
+    fail_selection_request(req);
+  }
   xcb_convert_selection(sync_->raw_conn(), sync_->window_id(),
                         synced_selection_, req->target, prop, req->time);
   sync_->conn().flush();
+}
+
+void Clipboard::fail_selection_request(
+    const xcb_selection_request_event_t *req) {
+  xcb_selection_notify_event_t resp = {};
+  resp.response_type = XCB_SELECTION_NOTIFY;
+  resp.sequence = 0;
+  resp.time = req->time;
+  resp.requestor = req->requestor;
+  resp.selection = req->selection;
+  resp.target = req->target;
+  resp.property = XCB_ATOM_NONE;
+  xcb_send_event(sync_->raw_conn(), /*propagate=*/0, req->requestor,
+                 XCB_EVENT_MASK_NO_EVENT,
+                 reinterpret_cast<const char *>(&resp));
+  sync_->conn().flush();
+}
+
+void Syncer::there_can_be_only_one() {
+  // We don't want multiple sync_clipboard processes to be running on the
+  // same X server at the same time.  Otherwise they would both race with each
+  // other trying to claim ownership of the keyboards, and might get stuck in a
+  // loop trying to ask each other for clipboard contents.
+  //
+  // Send a request to a custom selection buffer that we listen on.
+  // If we get a response, another sync_clipboard process is running.
+  dbg("checking uniqueness..");
+  xcb_convert_selection(raw_conn(), window_id(), unique_key_, unique_key_,
+                        unique_key_, XCB_CURRENT_TIME);
+  conn_.flush();
+  while (true) {
+    auto event = conn_.wait_for_event();
+    dbg("got event..");
+    const auto type = (event->response_type & 0x7f);
+
+    if (event->response_type == 0) {
+      const auto err = event.as<xcb_generic_error_t>();
+      throw std::runtime_error(fmt::format(
+          "unexpected XCB error during uniqueness check: {}", err->error_code));
+    } else if (type == XCB_SELECTION_NOTIFY) {
+      const auto ev = event.as<xcb_selection_notify_event_t>();
+      if (ev->selection == unique_key_) {
+        if (ev->property != XCB_ATOM_NONE) {
+          // Another sync_clipboard responded to us.
+          throw std::runtime_error(
+              "another sync_clipboard process appears to be running");
+        } else {
+          dbg("passed uniqueness check");
+          break;
+        }
+      }
+    } else if (type == XCB_PROPERTY_NOTIFY) {
+      // Ignore any property changes
+      dbg("ignoring property change");
+    } else {
+      warn("unexpected event during uniqueness check: {:d}", type);
+    }
+  }
+
+  // Claim ownership of the unique_key_ selection buffer,
+  // so that if another sync_clipboard starts we can tell it that we are
+  // already running.
+  xcb_set_selection_owner(raw_conn(), window_id(), unique_key_,
+                          XCB_CURRENT_TIME);
+  clipboard_.listen_for_changes();
+  primary_.listen_for_changes();
+  conn_.flush();
 }
 
 void Syncer::loop() {
@@ -613,8 +686,8 @@ void Syncer::handle_selection_owner_notify(
     return;
   }
 
-  Clipboard* modified;
-  Clipboard* synced;
+  Clipboard *modified;
+  Clipboard *synced;
   if (event->selection == clipboard_.atom()) {
     modified = &clipboard_;
     synced = &primary_;
@@ -678,6 +751,14 @@ void Syncer::handle_selection_clear(xcb_selection_clear_event_t *event) {
     clipboard_.lost_ownership(event->owner, event->time);
   } else if (event->selection == primary_.atom()) {
     primary_.lost_ownership(event->owner, event->time);
+  } else if (event->selection == unique_key_) {
+    // This potentially could happen if two sync_clipboard processes start at
+    // almost the same time, and both pass the uniqueness check before either
+    // one can claim the unique_key_ selection buffer.  If they both try to
+    // start, they will both try to claim the buffer but only one will win and
+    // the other will reach here.  Abort.
+    throw std::runtime_error(
+        "another sync_clipboard process appears to have started");
   } else {
     warn("unknown selection cleared: atom={}", event->selection);
   }
@@ -688,6 +769,23 @@ void Syncer::handle_selection_request(xcb_selection_request_event_t *event) {
     clipboard_.selection_request(event);
   } else if (event->selection == primary_.atom()) {
     primary_.selection_request(event);
+  } else if (event->selection == unique_key_) {
+    // Another sync_clipboard appears to be starting.
+    // Respond to it to let it know that we are already running.
+    xcb_selection_notify_event_t resp = {};
+    resp.response_type = XCB_SELECTION_NOTIFY;
+    resp.sequence = 0;
+    resp.time = event->time;
+    resp.requestor = event->requestor;
+    resp.selection = event->selection;
+    resp.target = event->target;
+    // We didn't actually put any data in the property, but we don't really
+    // care about the data, just that the property atom is set.
+    resp.property = event->property;
+    xcb_send_event(raw_conn(), /*propagate=*/0, event->requestor,
+                   XCB_EVENT_MASK_NO_EVENT,
+                   reinterpret_cast<const char *>(&resp));
+    conn_.flush();
   } else {
     warn("selection request for unknown selection: atom={}", event->selection);
   }
@@ -706,7 +804,6 @@ void Syncer::handle_selection_notify(xcb_selection_notify_event_t *event) {
   auto *req = find_request(event);
   if (!req) {
     warn("received XCB_SELECTION_NOTIFY event with no outstanding request");
-    fail_selection_request(*req);
     return;
   }
 
@@ -838,13 +935,15 @@ Request *Syncer::find_request(xcb_selection_notify_event_t *event) {
     // Since we don't have the source property ID, look up the entry by
     // the timestamp and other fields in the request
     for (auto &req : requests_) {
-      if (req.timestamp() == event->time && req.target() == event->target) {
+      if (req.state() == Request::State::PendingReply &&
+          req.timestamp() == event->time && req.target() == event->target) {
         return &req;
       }
     }
   } else {
     for (auto &req : requests_) {
-      if (req.local_prop() == event->property) {
+      if (req.state() == Request::State::PendingReply &&
+          req.local_prop() == event->property) {
         // We perhaps should also check event->selection and event->target here
         // too just to confirm they match what we expect?
         return &req;
@@ -967,6 +1066,7 @@ int main(int argc, char *argv[]) {
   try {
     Syncer sync;
     sync.init();
+    sync.there_can_be_only_one();
 
     sync.loop();
   } catch (const std::exception &ex) {
